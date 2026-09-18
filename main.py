@@ -1,4 +1,8 @@
 import os
+import asyncio
+import logging
+from typing import Optional
+
 import requests
 from telegram import Update
 from telegram.ext import (
@@ -15,368 +19,354 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 
 INTERVAL = "15min"
+OUTPUT_SIZE = 100
+REQUEST_TIMEOUT = 20
 
-# Keep this list small to avoid wasting Twelve Data credits.
+# Keep this list small on the free Twelve Data plan.
+# /time_series costs 1 API credit per symbol.
 SCAN_SYMBOLS = [
     "BTC/USD",
     "ETH/USD",
     "SOL/USD",
     "XRP/USD",
     "BNB/USD",
+    "ADA/USD",
 ]
 
-API_URL = "https://api.twelvedata.com/time_series"
+BASE_URL = "https://api.twelvedata.com/time_series"
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("crypto-market-bot")
+
+
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def ema(values: list[float], period: int) -> Optional[float]:
+    """Calculate the latest EMA value."""
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+    current = sum(values[:period]) / period
+
+    for price in values[period:]:
+        current = (price - current) * multiplier + current
+
+    return current
+
+
+def rsi(values: list[float], period: int = 14) -> Optional[float]:
+    """Calculate the latest RSI using Wilder's smoothing."""
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, period + 1):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    for i in range(period + 1, len(values)):
+        change = values[i] - values[i - 1]
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def make_signal(
+    price: float,
+    ema9_value: float,
+    ema21_value: float,
+    rsi_value: float,
+) -> tuple[str, str]:
+    """
+    Simple technical rule:
+      BUY  = EMA9 > EMA21 and RSI >= 50
+      SELL = EMA9 < EMA21 and RSI <= 50
+      WAIT = mixed/neutral conditions
+
+    This is technical-analysis logic only, not a guarantee of future movement.
+    """
+    if ema9_value > ema21_value and rsi_value >= 50:
+        if rsi_value >= 70:
+            return "BUY", "Bullish EMA alignment; RSI is strong/overbought."
+        return "BUY", "EMA 9 is above EMA 21 and RSI is above 50."
+
+    if ema9_value < ema21_value and rsi_value <= 50:
+        if rsi_value <= 30:
+            return "SELL", "Bearish EMA alignment; RSI is weak/oversold."
+        return "SELL", "EMA 9 is below EMA 21 and RSI is below 50."
+
+    return "WAIT", "EMA and RSI are not aligned strongly enough."
 
 
 # =========================================================
 # TWELVE DATA
 # =========================================================
 
-def get_market_data(symbol, outputsize=50):
-    """Get candles from Twelve Data."""
-
+def fetch_prices(symbol: str) -> tuple[Optional[list[float]], Optional[str]]:
+    """Fetch 15-minute closes. Returns (closes, error_message)."""
     if not TWELVE_DATA_KEY:
-        return {
-            "error": "TWELVE_DATA_KEY is missing."
-        }
+        return None, "TWELVE_DATA_KEY is missing."
+
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "outputsize": OUTPUT_SIZE,
+        "order": "asc",
+        "apikey": TWELVE_DATA_KEY,
+    }
 
     try:
         response = requests.get(
-            API_URL,
-            params={
-                "symbol": symbol,
-                "interval": INTERVAL,
-                "outputsize": outputsize,
-                "apikey": TWELVE_DATA_KEY,
-            },
-            timeout=15,
+            BASE_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
         )
+
+        if response.status_code == 429:
+            return None, (
+                "Twelve Data API limit reached (HTTP 429). "
+                "Wait for the quota to reset or use a larger plan."
+            )
+
+        response.raise_for_status()
 
         data = response.json()
 
-        # API error
-        if response.status_code == 429 or data.get("code") == 429:
-            return {
-                "error": (
-                    "Twelve Data API limit reached (429). "
-                    "The daily API credits have been exhausted."
-                ),
-                "rate_limited": True,
-            }
+        if "code" in data and "message" in data:
+            return None, str(data["message"])
 
-        if "status" in data and data["status"] == "error":
-            return {
-                "error": data.get(
-                    "message",
-                    "Twelve Data returned an error."
-                )
-            }
+        values = data.get("values")
+        if not values:
+            return None, "No market data returned."
 
-        if "values" not in data or not data["values"]:
-            return {
-                "error": "No market data returned."
-            }
+        closes = []
+        for row in values:
+            try:
+                closes.append(float(row["close"]))
+            except (KeyError, TypeError, ValueError):
+                continue
 
+        if len(closes) < 22:
+            return None, f"Not enough data points ({len(closes)})."
+
+        return closes, None
+
+    except requests.Timeout:
+        return None, "Twelve Data request timed out."
+
+    except requests.RequestException as exc:
+        return None, f"Network/API error: {exc}"
+
+    except ValueError:
+        return None, "Twelve Data returned invalid JSON."
+
+
+def analyze_symbol_data(symbol: str) -> dict:
+    closes, error = fetch_prices(symbol)
+
+    if error:
         return {
-            "values": data["values"]
+            "ok": False,
+            "symbol": symbol,
+            "error": error,
         }
 
-    except requests.RequestException as e:
+    price = closes[-1]
+    ema9_value = ema(closes, 9)
+    ema21_value = ema(closes, 21)
+    rsi_value = rsi(closes, 14)
+
+    if ema9_value is None or ema21_value is None or rsi_value is None:
         return {
-            "error": f"Network error: {str(e)}"
+            "ok": False,
+            "symbol": symbol,
+            "error": "Could not calculate indicators.",
         }
 
-    except Exception as e:
-        return {
-            "error": f"Unexpected error: {str(e)}"
-        }
-
-
-# =========================================================
-# SIMPLE TECHNICAL ANALYSIS
-# =========================================================
-
-def analyze_data(values):
-    """
-    Simple 15-minute analysis using:
-    - EMA 9
-    - EMA 21
-    - RSI 14
-    """
-
-    # Twelve Data returns newest first.
-    candles = list(reversed(values))
-
-    closes = []
-
-    for candle in candles:
-        try:
-            closes.append(float(candle["close"]))
-        except (KeyError, ValueError, TypeError):
-            continue
-
-    if len(closes) < 22:
-        return {
-            "signal": "WAIT",
-            "reason": "Not enough candle data.",
-        }
-
-    # -------------------------
-    # EMA
-    # -------------------------
-
-    def ema(data, period):
-        multiplier = 2 / (period + 1)
-        value = data[0]
-
-        for price in data[1:]:
-            value = (
-                price - value
-            ) * multiplier + value
-
-        return value
-
-    ema9 = ema(closes[-30:], 9)
-    ema21 = ema(closes[-30:], 21)
-
-    # -------------------------
-    # RSI
-    # -------------------------
-
-    period = 14
-    recent = closes[-(period + 1):]
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(recent)):
-        change = recent[i] - recent[i - 1]
-
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    if avg_loss == 0:
-        rsi = 100
-    else:
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-
-    current_price = closes[-1]
-
-    # -------------------------
-    # SIGNAL
-    # -------------------------
-
-    if ema9 > ema21 and rsi >= 50 and rsi < 70:
-        signal = "BUY"
-        reason = "EMA9 above EMA21 and RSI confirms upward momentum."
-
-    elif ema9 < ema21 and rsi <= 50 and rsi > 30:
-        signal = "SELL"
-        reason = "EMA9 below EMA21 and RSI confirms downward momentum."
-
-    else:
-        signal = "WAIT"
-        reason = "Indicators are mixed or market momentum is weak."
+    signal, reason = make_signal(
+        price,
+        ema9_value,
+        ema21_value,
+        rsi_value,
+    )
 
     return {
+        "ok": True,
+        "symbol": symbol,
+        "price": price,
+        "ema9": ema9_value,
+        "ema21": ema21_value,
+        "rsi": rsi_value,
         "signal": signal,
-        "price": current_price,
-        "ema9": ema9,
-        "ema21": ema21,
-        "rsi": rsi,
         "reason": reason,
     }
 
 
 # =========================================================
-# /START
+# TELEGRAM FORMATTERS
 # =========================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def format_analysis(result: dict) -> str:
+    symbol = result["symbol"]
 
-    await update.message.reply_text(
-        "🤖 ሰላም! Crypto Market Bot በ15-minute timeframe ላይ እየሰራ ነው.\n\n"
-        "📌 Commands:\n"
-        "/scan - የተመረጡ crypto symbols ይቃኛል\n"
-        "/all - ተመሳሳይ market scan\n"
-        "/analyze BTC/USD\n"
-        "/analyze ETH/USD\n"
-        "/analyze XAU/USD\n\n"
-        "⏱ Timeframe: 15 minutes"
+    if not result.get("ok"):
+        return (
+            f"❌ {symbol}\n"
+            f"Error: {result.get('error', 'Unknown error')}"
+        )
+
+    signal = result["signal"]
+
+    return (
+        f"📊 {symbol} — {INTERVAL}\n\n"
+        f"💰 Price: {result['price']:.8f}\n"
+        f"📈 EMA 9: {result['ema9']:.8f}\n"
+        f"📉 EMA 21: {result['ema21']:.8f}\n"
+        f"📊 RSI 14: {result['rsi']:.2f}\n\n"
+        f"🎯 Signal: {signal}\n"
+        f"📌 Reason: {result['reason']}\n\n"
+        "⚠️ Technical analysis only — not a guarantee of future price movement."
     )
 
 
 # =========================================================
-# /ANALYZE
+# TELEGRAM COMMANDS
 # =========================================================
 
-async def analyze_symbol(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 CryptoFlowBot is online.\n\n"
+        "Commands:\n"
+        "/analyze BTC/USD — analyze one symbol\n"
+        "/scan — scan the configured symbols\n"
+        "/all — same as /scan\n"
+        "/status — check bot/API configuration\n\n"
+        f"⏱ Timeframe: {INTERVAL}"
+    )
 
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token_ok = bool(TELEGRAM_BOT_TOKEN)
+    key_ok = bool(TWELVE_DATA_KEY)
+
+    await update.message.reply_text(
+        "🟢 Bot status\n\n"
+        f"Telegram token: {'✅ OK' if token_ok else '❌ Missing'}\n"
+        f"Twelve Data key: {'✅ OK' if key_ok else '❌ Missing'}\n"
+        f"Timeframe: {INTERVAL}\n"
+        f"Scan symbols: {len(SCAN_SYMBOLS)}\n"
+        f"Output size: {OUTPUT_SIZE}\n\n"
+        "Note: each /time_series symbol request uses 1 API credit."
+    )
+
+
+async def analyze_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Symbol ያስገቡ።\n\n"
+            "እባክዎ symbol ያስገቡ።\n"
             "ለምሳሌ:\n"
             "/analyze BTC/USD\n"
+            "/analyze ETH/USD\n"
             "/analyze XAU/USD"
         )
         return
 
-    symbol = context.args[0].upper()
+    symbol = context.args[0].upper().strip()
 
     await update.message.reply_text(
-        f"🔍 Analyzing {symbol}...\n"
-        f"⏱ Timeframe: {INTERVAL}"
+        f"🔍 {symbol} በ {INTERVAL} እየተመረመረ ነው..."
     )
 
-    result = get_market_data(symbol, 50)
+    # requests is blocking, so run it outside Telegram's event loop.
+    result = await asyncio.to_thread(analyze_symbol_data, symbol)
 
-    if "error" in result:
+    await update.message.reply_text(format_analysis(result))
 
-        if result.get("rate_limited"):
-            await update.message.reply_text(
-                "❌ Twelve Data API limit reached.\n\n"
-                "የዛሬ API credits ተጠናቀዋል። "
-                "Limit እስኪ reset ድረስ አዲስ market data "
-                "መውሰድ አይቻልም።"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ Data error:\n{result['error']}"
-            )
 
-        return
-
-    analysis = analyze_data(result["values"])
-
-    signal = analysis["signal"]
-
-    if signal == "BUY":
-        emoji = "🟢"
-    elif signal == "SELL":
-        emoji = "🔴"
-    else:
-        emoji = "🟡"
-
+async def scan_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"📊 {symbol} — {INTERVAL}\n\n"
-        f"💰 Price: {analysis.get('price', 0):.5f}\n"
-        f"EMA 9: {analysis.get('ema9', 0):.5f}\n"
-        f"EMA 21: {analysis.get('ema21', 0):.5f}\n"
-        f"RSI 14: {analysis.get('rsi', 0):.2f}\n\n"
-        f"{emoji} Signal: {signal}\n\n"
-        f"📝 {analysis['reason']}\n\n"
-        f"⚠️ This is technical analysis, not a guarantee of future price movement."
-    )
-
-
-# =========================================================
-# /SCAN
-# =========================================================
-
-async def scan_market(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🔍 Scanning selected symbols...\n"
-        "⏱ Timeframe: 15 minutes"
+        f"🔎 {len(SCAN_SYMBOLS)} symbols በ {INTERVAL} እየተመረመሩ ነው..."
     )
 
     results = []
-    rate_limited = False
 
     for symbol in SCAN_SYMBOLS:
+        result = await asyncio.to_thread(analyze_symbol_data, symbol)
 
-        data = get_market_data(symbol, 30)
+        if result.get("ok"):
+            results.append(result)
 
-        if "error" in data:
-
-            if data.get("rate_limited"):
-                rate_limited = True
-                break
-
-            continue
-
-        analysis = analyze_data(data["values"])
-
-        results.append(
-            (
-                symbol,
-                analysis["signal"],
-                analysis.get("rsi", 0),
-                analysis.get("price", 0),
-            )
-        )
-
-    # -------------------------
-    # API LIMIT
-    # -------------------------
-
-    if rate_limited:
-
-        await update.message.reply_text(
-            "⚠️ Twelve Data API limit reached.\n\n"
-            "አንዳንድ symbols ብቻ ተመርምረዋል። "
-            "የዛሬ API credits ከተጠናቀቁ በኋላ "
-            "አዲስ data እስኪፈቀድ ድረስ መጠበቅ ያስፈልጋል።"
-        )
-        return
-
-    # -------------------------
-    # NO RESULTS
-    # -------------------------
+        # Small pause so a large burst is avoided.
+        await asyncio.sleep(0.25)
 
     if not results:
-
         await update.message.reply_text(
-            "⚠️ No market data available.\n\n"
-            "Twelve Data API response ይመልከቱ።"
+            "⚠️ No usable market data was returned.\n\n"
+            "Check:\n"
+            "• Twelve Data API key\n"
+            "• API credit limit\n"
+            "• Symbol availability\n"
+            "• Render logs"
         )
         return
 
-    # -------------------------
-    # BUILD REPORT
-    # -------------------------
+    # Put strongest/simple signals first.
+    buys = [r for r in results if r["signal"] == "BUY"]
+    sells = [r for r in results if r["signal"] == "SELL"]
+    waits = [r for r in results if r["signal"] == "WAIT"]
 
-    message = "📊 15-Minute Market Scan\n\n"
+    lines = [
+        f"📊 {INTERVAL} MARKET SCAN",
+        "",
+        f"🟢 BUY: {len(buys)}",
+        f"🔴 SELL: {len(sells)}",
+        f"🟡 WAIT: {len(waits)}",
+        "",
+    ]
 
-    for symbol, signal, rsi, price in results:
+    for result in results:
+        icon = {
+            "BUY": "🟢",
+            "SELL": "🔴",
+            "WAIT": "🟡",
+        }.get(result["signal"], "⚪")
 
-        if signal == "BUY":
-            emoji = "🟢"
-        elif signal == "SELL":
-            emoji = "🔴"
-        else:
-            emoji = "🟡"
-
-        message += (
-            f"{emoji} {symbol}\n"
-            f"Signal: {signal}\n"
-            f"RSI: {rsi:.2f}\n"
-            f"Price: {price:.5f}\n\n"
+        lines.append(
+            f"{icon} {result['symbol']} | "
+            f"{result['signal']} | "
+            f"RSI {result['rsi']:.1f} | "
+            f"Price {result['price']:.8f}"
         )
 
-    message += (
-        "⚠️ Signals are based on simple technical indicators "
-        "and are not guaranteed predictions."
+    lines.extend(
+        [
+            "",
+            "⚠️ Technical analysis only.",
+            "Not a guarantee of future price movement.",
+        ]
     )
 
-    await update.message.reply_text(message)
+    await update.message.reply_text("\n".join(lines))
 
 
 # =========================================================
@@ -384,49 +374,33 @@ async def scan_market(
 # =========================================================
 
 def main():
-
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN not found!")
-        return
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing from Render Environment Variables."
+        )
 
     if not TWELVE_DATA_KEY:
-        print("❌ TWELVE_DATA_KEY not found!")
-        return
+        raise RuntimeError(
+            "TWELVE_DATA_KEY is missing from Render Environment Variables."
+        )
 
-    print("🤖 Crypto Market Bot starting...")
-    print("⏱ Timeframe:", INTERVAL)
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("analyze", analyze_symbol))
+    application.add_handler(CommandHandler("scan", scan_market))
+    application.add_handler(CommandHandler("all", scan_market))
 
-    application.add_handler(
-        CommandHandler("start", start)
-    )
+    logger.info("CryptoFlowBot is running.")
+    logger.info("Timeframe: %s", INTERVAL)
+    logger.info("Symbols: %s", ", ".join(SCAN_SYMBOLS))
 
-    application.add_handler(
-        CommandHandler("scan", scan_market)
-    )
-
-    application.add_handler(
-        CommandHandler("all", scan_market)
-    )
-
-    application.add_handler(
-        CommandHandler("analyze", analyze_symbol)
-    )
-
-    print("✅ Bot is running.")
-
-    # Run ONE polling instance.
+    # run_polling() already keeps the bot alive.
+    # Do NOT wrap it in while True.
     application.run_polling()
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
-
 if __name__ == "__main__":
     main()
+
